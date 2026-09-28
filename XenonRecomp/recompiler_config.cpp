@@ -91,6 +91,26 @@ void RecompilerConfig::Load(const std::string_view& configFilePath)
                 }
             }
         }
+
+        // A title may need a small, evidence-backed switch-table correction
+        // without modifying its preserved XenonAnalyse output.  These entries
+        // use the same schema as the external switch-table file and are loaded
+        // afterwards so a verified title-specific entry can replace an
+        // analysis result at the same base if necessary.
+        if (auto switchArray = main["switches"].as_array())
+        {
+            for (auto& entry : *switchArray)
+            {
+                auto& table = *entry.as_table();
+                RecompilerSwitchTable switchTable;
+                switchTable.r = *table["r"].value<uint32_t>();
+                for (auto& label : *table["labels"].as_array())
+                    switchTable.labels.push_back(*label.value<uint32_t>());
+
+                uint32_t base = *table["base"].value<uint32_t>();
+                switchTables.insert_or_assign(base, std::move(switchTable));
+            }
+        }
     }
 
     if (auto midAsmHookArray = toml["midasm_hook"].as_array())

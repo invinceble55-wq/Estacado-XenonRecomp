@@ -95,6 +95,20 @@ bool Recompiler::LoadConfig(const std::string_view& configFilePath)
 
 void Recompiler::Analyse()
 {
+    // Manual function ranges are ownership assertions.  The direct-call
+    // discovery pass must not introduce a competing entry inside one, because
+    // that would split its configured switch targets back into separate C++
+    // functions before the normal sequential pass can skip the range.
+    auto isInConfiguredFunction = [&](size_t address)
+        {
+            for (const auto& [base, size] : config.functions)
+            {
+                if (address >= base && address < uint64_t(base) + size)
+                    return true;
+            }
+            return false;
+        };
+
     for (size_t i = 14; i < 128; i++)
     {
         if (i < 32)
@@ -210,7 +224,8 @@ void Recompiler::Analyse()
             {
                 size_t address = base + (data - section.data) + PPC_BI(insn);
 
-                if (address >= section.base && address < section.base + section.size && image.symbols.find(address) == image.symbols.end())
+                if (address >= section.base && address < section.base + section.size &&
+                    !isInConfiguredFunction(address) && image.symbols.find(address) == image.symbols.end())
                 {
                     auto data = section.data + address - section.base;
                     auto& fn = functions.emplace_back(Function::Analyze(data, section.base + section.size - address, address));
@@ -307,6 +322,15 @@ bool Recompiler::Recompile(
                 return fmt::format("cr{}", index);
             }
             return fmt::format("ctx.cr{}", index);
+        };
+
+    // CR logical instructions address one of the architectural 32 CR bits,
+    // not a whole four-bit CR field.  Keep the mapping adjacent to the CR
+    // register selector so local CR-field tracking remains correct.
+    auto crBit = [&](size_t bit)
+        {
+            constexpr std::string_view fields[] = { "lt", "gt", "eq", "so" };
+            return fmt::format("{}.{}", cr(bit / 4), fields[bit % 4]);
         };
 
     auto ctr = [&]()
@@ -609,7 +633,13 @@ bool Recompiler::Recompile(
     case PPC_INST_BCTR:
         if (switchTable != config.switchTables.end())
         {
-            println("\tswitch ({}.u64) {{", r(switchTable->second.r));
+            // Xenon jump-table selectors are compared and indexed as 32-bit
+            // values.  The upper half of a GPR is not necessarily clear here:
+            // for example, lwz 0xFFFFFFFF followed by addi 9 produces
+            // 0x0000000100000008 while cmplwi/rlwinm still select case 8.
+            // Dispatching on u64 would miss that valid case and enter undefined
+            // host behavior through the default branch.
+            println("\tswitch ({}.u32) {{", r(switchTable->second.r));
 
             for (size_t i = 0; i < switchTable->second.labels.size(); i++)
             {
@@ -617,9 +647,23 @@ bool Recompiler::Recompile(
                 auto label = switchTable->second.labels[i];
                 if (label < fn.base || label >= fn.base + fn.size)
                 {
-                    println("\t\t// ERROR: 0x{:X}", label);
-                    fmt::println("ERROR: Switch case at {:X} is trying to jump outside function: {:X}", base, label);
-                    println("\t\treturn;");
+                    // A CTR table may legitimately tail-transfer to a separately
+                    // generated entry.  This is the same PPC `b` representation
+                    // used above: share ctx/base, preserve ctx.lr, then return
+                    // from the current C++ frame.  Do not accept arbitrary
+                    // addresses: an exact function symbol is required.
+                    auto targetSymbol = image.symbols.find(label);
+                    if (targetSymbol != image.symbols.end() && targetSymbol->address == label && targetSymbol->type == Symbol_Function)
+                    {
+                        printFunctionCall(label);
+                        println("\t\treturn;");
+                    }
+                    else
+                    {
+                        println("\t\t// ERROR: 0x{:X}", label);
+                        fmt::println("ERROR: Switch case at {:X} is trying to jump outside function: {:X}", base, label);
+                        println("\t\treturn;");
+                    }
                 }
                 else
                 {
@@ -760,6 +804,14 @@ bool Recompiler::Recompile(
         println("\t{}.compare<int64_t>({}.s64, {}.s64, {});", cr(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]), xer());
         break;
 
+    case PPC_INST_CROR:
+        println("\t{} = {} || {};", crBit(insn.operands[0]), crBit(insn.operands[1]), crBit(insn.operands[2]));
+        break;
+
+    case PPC_INST_CRORC:
+        println("\t{} = {} || !{};", crBit(insn.operands[0]), crBit(insn.operands[1]), crBit(insn.operands[2]));
+        break;
+
     case PPC_INST_CMPDI:
         println("\t{}.compare<int64_t>({}.s64, {}, {});", cr(insn.operands[0]), r(insn.operands[1]), int32_t(insn.operands[2]), xer());
         break;
@@ -797,11 +849,18 @@ bool Recompiler::Recompile(
         break;
 
     case PPC_INST_DB16CYC:
-        // no op
+        // Xenon spin-wait hint. The default generated-code hook is a no-op,
+        // while an embedding runtime may use it for a host processor pause or
+        // cooperative lifecycle cancellation without changing guest state.
+        println("\tPPC_RUNTIME_DB16CYC();");
         break;
 
     case PPC_INST_DCBF:
         // no op
+        break;
+
+    case PPC_INST_DCBST:
+        // no op (data cache block store: cache management only)
         break;
 
     case PPC_INST_DCBT:
@@ -965,6 +1024,11 @@ bool Recompiler::Recompile(
         println("\t{}.u64 = {}.u64 ^ 0x8000000000000000;", f(insn.operands[0]), f(insn.operands[1]));
         break;
 
+    case PPC_INST_FNMADD:
+        printSetFlushMode(false);
+        println("\t{}.f64 = -({}.f64 * {}.f64 + {}.f64);", f(insn.operands[0]), f(insn.operands[1]), f(insn.operands[2]), f(insn.operands[3]));
+        break;
+
     case PPC_INST_FNMADDS:
         printSetFlushMode(false);
         println("\t{}.f64 = double(float(-({}.f64 * {}.f64 + {}.f64)));", f(insn.operands[0]), f(insn.operands[1]), f(insn.operands[2]), f(insn.operands[3]));
@@ -983,6 +1047,14 @@ bool Recompiler::Recompile(
     case PPC_INST_FRES:
         printSetFlushMode(false);
         println("\t{}.f64 = float(1.0 / {}.f64);", f(insn.operands[0]), f(insn.operands[1]));
+        break;
+
+    case PPC_INST_FRSQRTE:
+        printSetFlushMode(false);
+        if (strchr(insn.opcode->name, '.'))
+            println("\tPPC_FRSQRTE({}, ctx.fpscr, {}, &{});", f(insn.operands[0]), f(insn.operands[1]), cr(1));
+        else
+            println("\tPPC_FRSQRTE({}, ctx.fpscr, {});", f(insn.operands[0]), f(insn.operands[1]));
         break;
 
     case PPC_INST_FRSP:
@@ -1213,6 +1285,18 @@ bool Recompiler::Recompile(
         break;
 
     case PPC_INST_LWZ:
+        // Title-runtime liveness probe: these are the two XEX reads that
+        // decide whether sub_821F0EB0 may leave its completion loop. Emit
+        // before the load because the destination can also be the EA register.
+        if (base == 0x821F0FB8 || base == 0x821F0FD4) {
+            print("\tPPC_RUNTIME_MEMORY_READ(0x{:08X}, ", base);
+            if (insn.operands[2] != 0)
+                print("{}.u32 + ", r(insn.operands[2]));
+            print("{}, PPC_LOAD_U32(", int32_t(insn.operands[1]));
+            if (insn.operands[2] != 0)
+                print("{}.u32 + ", r(insn.operands[2]));
+            println("{}));", int32_t(insn.operands[1]));
+        }
         print("\t{}.u64 = PPC_LOAD_U32(", r(insn.operands[0]));
         if (insn.operands[2] != 0)
             print("{}.u32 + ", r(insn.operands[2]));
@@ -1260,7 +1344,7 @@ bool Recompiler::Recompile(
         break;
 
     case PPC_INST_MFTB:
-        println("\t{}.u64 = __rdtsc();", r(insn.operands[0]));
+        println("\t{}.u64 = PPC_READ_TIME_BASE();", r(insn.operands[0]));
         break;
 
     case PPC_INST_MR:
@@ -1309,6 +1393,12 @@ bool Recompiler::Recompile(
         println("\t{}.u64 = (uint64_t({}.u32) * uint64_t({}.u32)) >> 32;", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
         if (strchr(insn.opcode->name, '.'))
             println("\t{}.compare<int32_t>({}.s32, 0, {});", cr(0), r(insn.operands[0]), xer());
+        break;
+
+    case PPC_INST_MULHD:
+        println("\t{}.u64 = PPC_MULHD({}.u64, {}.u64);", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
+        if (strchr(insn.opcode->name, '.'))
+            println("\t{}.compare<int64_t>({}.s64, 0, {});", cr(0), r(insn.operands[0]), xer());
         break;
 
     case PPC_INST_MULLD:
@@ -1635,10 +1725,10 @@ bool Recompiler::Recompile(
 
     case PPC_INST_STVX:
     case PPC_INST_STVX128:
-        print("\tsimde_mm_store_si128((simde__m128i*)(base + ((");
+        print("\tPPC_STORE_V128((");
         if (insn.operands[1] != 0)
             print("{}.u32 + ", r(insn.operands[1]));
-        println("{}.u32) & ~0xF)), simde_mm_shuffle_epi8(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*)VectorMaskL)));", r(insn.operands[2]), v(insn.operands[0]));
+        println("{}.u32) & ~0xF, simde_mm_shuffle_epi8(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*)VectorMaskL)));", r(insn.operands[2]), v(insn.operands[0]));
         break;
 
     case PPC_INST_STW:
@@ -1769,8 +1859,37 @@ bool Recompiler::Recompile(
         println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_and_si128(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
         break;
 
+    case PPC_INST_VANDC:
+        println("\tPPC_VANDC({}, {}, {});", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
+        break;
+
+    case PPC_INST_VADDSWS:
+        println("\tPPC_VADDSWS({}, ctx.vscr, {}, {});", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
+        break;
+
+    case PPC_INST_VADDSBS:
+        println("\tPPC_VADDSBS({}, ctx.vscr, {}, {});", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
+        break;
+
+    case PPC_INST_EQV:
+        println("\t{}.u64 = ~({}.u64 ^ {}.u64);", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
+        break;
+
+    case PPC_INST_MFVSCR:
+        println("\t{} = {{}};", v(insn.operands[0]));
+        println("\t{}.u32[0] = ctx.vscr;", v(insn.operands[0]));
+        break;
+
+    case PPC_INST_MTVSCR:
+        println("\tctx.vscr = {}.u32[0];", v(insn.operands[0]));
+        break;
+
     case PPC_INST_VANDC128:
         println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_andnot_si128(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8)));", v(insn.operands[0]), v(insn.operands[2]), v(insn.operands[1]));
+        break;
+
+    case PPC_INST_VNOR:
+        println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_xor_si128(simde_mm_or_si128(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8)), simde_mm_set1_epi32(-1)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
         break;
 
     case PPC_INST_VAVGSB:
@@ -1789,6 +1908,16 @@ bool Recompiler::Recompile(
     case PPC_INST_VCFPSXWS128:
         printSetFlushMode(true);
         print("\tsimde_mm_store_si128((simde__m128i*){}.s32, simde_mm_vctsxs(", v(insn.operands[0]));
+        if (insn.operands[2] != 0)
+            println("simde_mm_mul_ps(simde_mm_load_ps({}.f32), simde_mm_set1_ps({}))));", v(insn.operands[1]), 1u << insn.operands[2]);
+        else
+            println("simde_mm_load_ps({}.f32)));", v(insn.operands[1]));
+        break;
+
+    case PPC_INST_VCTUXS:
+    case PPC_INST_VCFPUXWS128:
+        printSetFlushMode(true);
+        print("\tsimde_mm_store_si128((simde__m128i*){}.u32, simde_mm_vctuxs(", v(insn.operands[0]));
         if (insn.operands[2] != 0)
             println("simde_mm_mul_ps(simde_mm_load_ps({}.f32), simde_mm_set1_ps({}))));", v(insn.operands[1]), 1u << insn.operands[2]);
         else
@@ -1855,6 +1984,12 @@ bool Recompiler::Recompile(
             println("\t{}.setFromMask(simde_mm_load_ps({}.f32), 0xF);", cr(6), v(insn.operands[0]));
         break;
 
+    case PPC_INST_VCMPEQUH:
+        println("\tsimde_mm_store_si128((simde__m128i*){}.u16, simde_mm_cmpeq_epi16(simde_mm_load_si128((simde__m128i*){}.u16), simde_mm_load_si128((simde__m128i*){}.u16)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
+        if (strchr(insn.opcode->name, '.'))
+            println("\t{}.setFromMask(simde_mm_load_si128((simde__m128i*){}.u8), 0xFFFF);", cr(6), v(insn.operands[0]));
+        break;
+
     case PPC_INST_VCMPGEFP:
     case PPC_INST_VCMPGEFP128:
         printSetFlushMode(true);
@@ -1877,6 +2012,18 @@ bool Recompiler::Recompile(
 
     case PPC_INST_VCMPGTUH:
         println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_cmpgt_epu16(simde_mm_load_si128((simde__m128i*){}.u16), simde_mm_load_si128((simde__m128i*){}.u16)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
+        break;
+
+    case PPC_INST_VCMPGTSH:
+        println("\tsimde_mm_store_si128((simde__m128i*){}.u16, simde_mm_cmpgt_epi16(simde_mm_load_si128((simde__m128i*){}.u16), simde_mm_load_si128((simde__m128i*){}.u16)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
+        if (strchr(insn.opcode->name, '.'))
+            println("\t{}.setFromMask(simde_mm_load_si128((simde__m128i*){}.u8), 0xFFFF);", cr(6), v(insn.operands[0]));
+        break;
+
+    case PPC_INST_VCMPGTSW:
+        println("\tsimde_mm_store_si128((simde__m128i*){}.u32, simde_mm_cmpgt_epi32(simde_mm_load_si128((simde__m128i*){}.u32), simde_mm_load_si128((simde__m128i*){}.u32)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
+        if (strchr(insn.opcode->name, '.'))
+            println("\t{}.setFromMask(simde_mm_load_si128((simde__m128i*){}.u8), 0xFFFF);", cr(6), v(insn.operands[0]));
         break;
 
     case PPC_INST_VEXPTEFP:
@@ -1910,6 +2057,14 @@ bool Recompiler::Recompile(
 
     case PPC_INST_VMAXSW:
         println("\tsimde_mm_store_si128((simde__m128i*){}.u32, simde_mm_max_epi32(simde_mm_load_si128((simde__m128i*){}.u32), simde_mm_load_si128((simde__m128i*){}.u32)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
+        break;
+
+    case PPC_INST_VMAXSH:
+        println("\tPPC_VMAXSH({}, {}, {});", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
+        break;
+
+    case PPC_INST_VMAXUH:
+        println("\tsimde_mm_store_si128((simde__m128i*){}.u16, simde_mm_max_epu16(simde_mm_load_si128((simde__m128i*){}.u16), simde_mm_load_si128((simde__m128i*){}.u16)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
         break;
 
     case PPC_INST_VMINFP:
@@ -2087,7 +2242,11 @@ bool Recompiler::Recompile(
         println("\tsimde_mm_store_ps({}.f32, simde_mm_div_ps(simde_mm_set1_ps(1), simde_mm_sqrt_ps(simde_mm_load_ps({}.f32))));", v(insn.operands[0]), v(insn.operands[1]));
         break;
 
+    // vsel128 has the same four vector operands and per-bit select semantics
+    // as architectural vsel; the Xenon decoder exposes its extended register
+    // encoding as a distinct instruction id.
     case PPC_INST_VSEL:
+    case PPC_INST_VSEL128:
         println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_or_si128(simde_mm_andnot_si128(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8)), simde_mm_and_si128(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8))));", v(insn.operands[0]), v(insn.operands[3]), v(insn.operands[1]), v(insn.operands[3]), v(insn.operands[2]));
         break;
 
@@ -2095,6 +2254,50 @@ bool Recompiler::Recompile(
         // TODO: vectorize
         for (size_t i = 0; i < 16; i++)
             println("\t{}.u8[{}] = {}.u8[{}] << ({}.u8[{}] & 0x7);", v(insn.operands[0]), i, v(insn.operands[1]), i, v(insn.operands[2]), i);
+        break;
+
+    case PPC_INST_VMINSH:
+        println("\tPPC_VMINSH({}, {}, {});", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
+        break;
+
+    case PPC_INST_VMINUH:
+        println("\tsimde_mm_store_si128((simde__m128i*){}.u16, simde_mm_min_epu16(simde_mm_load_si128((simde__m128i*){}.u16), simde_mm_load_si128((simde__m128i*){}.u16)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
+        break;
+
+    case PPC_INST_VMINSW:
+        println("\tsimde_mm_store_si128((simde__m128i*){}.u32, simde_mm_min_epi32(simde_mm_load_si128((simde__m128i*){}.u32), simde_mm_load_si128((simde__m128i*){}.u32)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
+        break;
+
+    case PPC_INST_VAVGUH:
+        println("\tsimde_mm_store_si128((simde__m128i*){}.u16, simde_mm_avg_epu16(simde_mm_load_si128((simde__m128i*){}.u16), simde_mm_load_si128((simde__m128i*){}.u16)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
+        break;
+
+    case PPC_INST_VPKSWSS:
+        println("\tPPC_VPKSWSS({}, ctx.vscr, {}, {});", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
+        break;
+
+    case PPC_INST_VPKSWUS:
+        println("\tPPC_VPKSWUS({}, ctx.vscr, {}, {});", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
+        break;
+
+    case PPC_INST_VPKUWUM:
+        println("\tPPC_VPKUWUM({}, {}, {});", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
+        break;
+
+    case PPC_INST_VPKSHSS:
+        println("\tPPC_VPKSHSS({}, ctx.vscr, {}, {});", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
+        break;
+
+    case PPC_INST_VPKUHUS:
+        println("\tPPC_VPKUHUS({}, ctx.vscr, {}, {});", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
+        break;
+
+    case PPC_INST_VSLH:
+        println("\tPPC_VSLH({}, {}, {});", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
+        break;
+
+    case PPC_INST_VSRAH:
+        println("\tPPC_VSRAH({}, {}, {});", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
         break;
 
     case PPC_INST_VSLDOI:
@@ -2130,9 +2333,17 @@ bool Recompiler::Recompile(
         println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_set1_epi8(char(0x{:X})));", v(insn.operands[0]), insn.operands[1]);
         break;
 
+    case PPC_INST_VSPLTISH:
+        println("\tPPC_VSPLTISH({}, int32_t(0x{:X}));", v(insn.operands[0]), insn.operands[1]);
+        break;
+
     case PPC_INST_VSPLTISW:
     case PPC_INST_VSPLTISW128:
         println("\tsimde_mm_store_si128((simde__m128i*){}.u32, simde_mm_set1_epi32(int(0x{:X})));", v(insn.operands[0]), insn.operands[1]);
+        break;
+
+    case PPC_INST_VSUBSHS:
+        println("\tPPC_VSUBSHS({}, ctx.vscr, {}, {});", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
         break;
 
     case PPC_INST_VSPLTW:
@@ -2182,8 +2393,32 @@ bool Recompiler::Recompile(
         println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_subs_epu8(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
         break;
 
+    case PPC_INST_VSUBUHS:
+        println("\tPPC_VSUBUHS({}, ctx.vscr, {}, {});", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
+        break;
+
+    case PPC_INST_VSRH:
+        println("\tPPC_VSRH({}, {}, {});", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
+        break;
+
+    case PPC_INST_VSRAB:
+        println("\tPPC_VSRAB({}, {}, {});", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
+        break;
+
+    case PPC_INST_VRLH:
+        println("\tPPC_VRLH({}, {}, {});", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
+        break;
+
+    case PPC_INST_VSUBUBM:
+        println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_sub_epi8(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
+        break;
+
     case PPC_INST_VSUBUHM:
         println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_sub_epi16(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
+        break;
+
+    case PPC_INST_VSUBUWM:
+        println("\tsimde_mm_store_si128((simde__m128i*){}.u32, simde_mm_sub_epi32(simde_mm_load_si128((simde__m128i*){}.u32), simde_mm_load_si128((simde__m128i*){}.u32)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
         break;
 
     case PPC_INST_VUPKD3D128:
@@ -2387,6 +2622,7 @@ bool Recompiler::Recompile(const Function& fn)
 
     println("PPC_FUNC_IMPL(__imp__{}) {{", name);
     println("\tPPC_FUNC_PROLOGUE();");
+    println("\tPPC_RUNTIME_FUNCTION_ENTER(0x{:08X}, ctx, base);", fn.base);
 
     auto switchTable = config.switchTables.end();
     bool allRecompiled = true;
@@ -2411,6 +2647,40 @@ bool Recompiler::Recompile(const Function& fn)
 
         if (switchTable == config.switchTables.end())
             switchTable = config.switchTables.find(base);
+
+        // Bounded title-runtime probes for the M5 state-machine trace. These
+        // execute immediately before the named guest instruction, allowing
+        // call-return values to be observed without changing guest state.
+        switch (base)
+        {
+        case 0x820C85BC:
+        case 0x820C85D8:
+        case 0x820C85EC:
+        case 0x820C8694:
+        case 0x820C86A0:
+        case 0x820C8894:
+        case 0x820C88C4:
+        case 0x820C0F88:
+        case 0x822159E8:
+        case 0x82215A00:
+        case 0x82215A18:
+        case 0x82216068:
+        case 0x8259DDF4:
+        case 0x8259DE0C:
+        case 0x8259DE10:
+        case 0x825A558C:
+        case 0x825A5710:
+        // The Darkness probe 48: bracket the two dynamically reached
+        // reciprocal-square-root estimates that feed the prompt transform.
+        // These observations are emitted by the runtime and do not alter
+        // guest state.
+        case 0x82358198:
+        case 0x8235819C:
+        case 0x823582B4:
+        case 0x823582B8:
+            println("\tPPC_RUNTIME_PC_PROBE(0x{:08X}, ctx, base);", base);
+            break;
+        }
 
         ppc::Disassemble(data, 4, base, insn);
 

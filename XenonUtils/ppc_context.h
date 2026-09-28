@@ -6,6 +6,7 @@
 #endif
 
 #include <climits>
+#include <chrono>
 #include <cmath>
 #include <csetjmp>
 #include <cstdint>
@@ -15,6 +16,22 @@
 #include <x86/avx.h>
 #include <x86/sse.h>
 #include <x86/sse4.1.h>
+
+inline constexpr uint64_t PPC_TIME_BASE_FREQUENCY = 50'000'000ULL;
+inline constexpr uint64_t PPC_TIME_BASE_NANOSECONDS_PER_TICK = 20ULL;
+
+constexpr uint64_t PPC_TIME_BASE_FROM_NANOSECONDS(uint64_t nanoseconds) noexcept
+{
+    return nanoseconds / PPC_TIME_BASE_NANOSECONDS_PER_TICK;
+}
+
+inline uint64_t PPC_READ_TIME_BASE() noexcept
+{
+    using namespace std::chrono;
+    const auto nanoseconds = duration_cast<std::chrono::nanoseconds>(
+        steady_clock::now().time_since_epoch()).count();
+    return PPC_TIME_BASE_FROM_NANOSECONDS(static_cast<uint64_t>(nanoseconds));
+}
 
 // SSE3 constants are missing from simde
 #ifndef _MM_DENORMALS_ZERO_MASK
@@ -83,6 +100,13 @@
 #define PPC_STORE_U64(x, y) *(volatile uint64_t*)(base + (x)) = __builtin_bswap64(y)
 #endif
 
+// Keep full-vector guest stores overridable for runtimes that maintain
+// CPU/GPU mirrors of physical memory. The value supplied by the recompiler is
+// already byte-shuffled into guest memory order.
+#ifndef PPC_STORE_V128
+#define PPC_STORE_V128(x, y) simde_mm_store_si128((simde__m128i*)(base + (x)), (y))
+#endif
+
 // MMIO Store handling is completely reliant on being preeceded by eieio.
 // TODO: Verify if that's always the case.
 #ifndef PPC_MM_STORE_U8
@@ -105,12 +129,39 @@
 #define PPC_CALL_FUNC(x) x(ctx, base)
 #endif
 
+// Runtime diagnostics may override this at compile time.  The default is
+// deliberately a no-op so generated code remains standalone and behaviour is
+// unchanged outside the title runtime.
+#ifndef PPC_RUNTIME_FUNCTION_ENTER
+#define PPC_RUNTIME_FUNCTION_ENTER(address, context, imageBase) ((void)0)
+#endif
+
+#ifndef PPC_RUNTIME_MEMORY_READ
+#define PPC_RUNTIME_MEMORY_READ(instruction, address, value) ((void)0)
+#endif
+
+#ifndef PPC_RUNTIME_PC_PROBE
+#define PPC_RUNTIME_PC_PROBE(address, context, imageBase) ((void)0)
+#endif
+
+// Xenon-specific 16-cycle delay hint. It has no architectural side effects,
+// so standalone generated code may leave it empty. Embedding runtimes can
+// override this to provide a host spin hint and cooperative stop observation.
+#ifndef PPC_RUNTIME_DB16CYC
+#define PPC_RUNTIME_DB16CYC() ((void)0)
+#endif
+
 #define PPC_MEMORY_SIZE 0x100000000ull
 
 #define PPC_LOOKUP_FUNC(x, y) *(PPCFunc**)(x + PPC_IMAGE_BASE + PPC_IMAGE_SIZE + (uint64_t(uint32_t(y) - PPC_CODE_BASE) * 2))
 
+#ifndef PPC_RUNTIME_INDIRECT_CALL
+#define PPC_RUNTIME_INDIRECT_CALL(address, context, imageBase) \
+    (PPC_LOOKUP_FUNC(imageBase, address))(context, imageBase)
+#endif
+
 #ifndef PPC_CALL_INDIRECT_FUNC
-#define PPC_CALL_INDIRECT_FUNC(x) (PPC_LOOKUP_FUNC(base, x))(ctx, base)
+#define PPC_CALL_INDIRECT_FUNC(x) PPC_RUNTIME_INDIRECT_CALL(x, ctx, base)
 #endif
 
 typedef void PPCFunc(struct PPCContext& __restrict__ ctx, uint8_t* base);
@@ -136,6 +187,33 @@ union PPCRegister
     float f32;
     double f64;
 };
+
+// High 64 bits of a 64x64 unsigned product, expressed entirely in portable
+// 32-bit partial products.  This is used to derive PPC64 mulhd without
+// relying on a compiler-specific 128-bit integer type in generated code.
+inline uint64_t PPC_MULHDU(uint64_t a, uint64_t b) noexcept
+{
+    const uint64_t a0 = static_cast<uint32_t>(a);
+    const uint64_t a1 = a >> 32;
+    const uint64_t b0 = static_cast<uint32_t>(b);
+    const uint64_t b1 = b >> 32;
+    const uint64_t p00 = a0 * b0;
+    const uint64_t p01 = a0 * b1;
+    const uint64_t p10 = a1 * b0;
+    const uint64_t p11 = a1 * b1;
+    const uint64_t carry = (p00 >> 32) + static_cast<uint32_t>(p01) + static_cast<uint32_t>(p10);
+    return p11 + (p01 >> 32) + (p10 >> 32) + (carry >> 32);
+}
+
+// PowerPC mulhd returns the high signed doubleword.  The adjustment converts
+// the unsigned 128-bit product to its two's-complement signed equivalent.
+inline uint64_t PPC_MULHD(uint64_t a, uint64_t b) noexcept
+{
+    uint64_t high = PPC_MULHDU(a, b);
+    if (static_cast<int64_t>(a) < 0) high -= b;
+    if (static_cast<int64_t>(b) < 0) high -= a;
+    return high;
+}
 
 struct PPCXERRegister
 {
@@ -205,6 +283,224 @@ union alignas(0x10) PPCVRegister
     double f64[2];
 };
 
+// VMX vslh: shift each 16-bit element of vA left by the low four bits of
+// the corresponding vB element.  Compute into a temporary so vD may alias
+// either source register, as the architectural instruction permits.
+inline void PPC_VSLH(PPCVRegister& d, const PPCVRegister& a, const PPCVRegister& b) noexcept
+{
+    PPCVRegister result{};
+    for (size_t i = 0; i < 8; i++)
+    {
+        const uint32_t shift = b.u16[i] & 0xF;
+        result.u16[i] = static_cast<uint16_t>(static_cast<uint32_t>(a.u16[i]) << shift);
+    }
+    d = result;
+}
+
+inline void PPC_VSRAH(PPCVRegister& d, const PPCVRegister& a, const PPCVRegister& b) noexcept
+{
+    PPCVRegister result{};
+    for (size_t i = 0; i < 8; i++)
+    {
+        const uint32_t shift = b.u16[i] & 0xF;
+        const uint16_t logical = a.u16[i] >> shift;
+        const uint16_t signFill = (a.u16[i] & 0x8000) && shift
+            ? static_cast<uint16_t>(0xFFFFu << (16 - shift)) : 0;
+        result.u16[i] = logical | signFill;
+    }
+    d = result;
+}
+
+inline void PPC_VSPLTISH(PPCVRegister& d, int32_t immediate) noexcept
+{
+    const uint16_t value = static_cast<uint16_t>(static_cast<int16_t>(immediate));
+    for (size_t i = 0; i < 8; i++) d.u16[i] = value;
+}
+
+// VMX vandc: vA & ~vB, independently for all 128 bits.
+inline void PPC_VANDC(PPCVRegister& d, const PPCVRegister& a, const PPCVRegister& b) noexcept
+{
+    PPCVRegister result{};
+    for (size_t i = 0; i < 16; i++) result.u8[i] = a.u8[i] & static_cast<uint8_t>(~b.u8[i]);
+    d = result;
+}
+
+// VMX vmaxsh/vminsh compare signed 16-bit elements.  The temporary preserves
+// architectural behavior when vD aliases either input.
+inline void PPC_VMAXSH(PPCVRegister& d, const PPCVRegister& a, const PPCVRegister& b) noexcept
+{
+    PPCVRegister result{};
+    for (size_t i = 0; i < 8; i++) result.s16[i] = a.s16[i] >= b.s16[i] ? a.s16[i] : b.s16[i];
+    d = result;
+}
+
+inline void PPC_VMINSH(PPCVRegister& d, const PPCVRegister& a, const PPCVRegister& b) noexcept
+{
+    PPCVRegister result{};
+    for (size_t i = 0; i < 8; i++) result.s16[i] = a.s16[i] < b.s16[i] ? a.s16[i] : b.s16[i];
+    d = result;
+}
+
+// VSCR bit numbering is architectural (bit 31 is the least-significant bit
+// of the right-aligned 32-bit status value). Saturating VMX operations set it
+// persistently; only mtvscr can clear it.
+constexpr uint32_t PPC_VSCR_SAT = 0x00000001u;
+
+inline void PPC_VSUBSHS(PPCVRegister& d, uint32_t& vscr, const PPCVRegister& a, const PPCVRegister& b) noexcept
+{
+    PPCVRegister result{};
+    bool saturated = false;
+    for (size_t i = 0; i < 8; i++)
+    {
+        const int32_t value = static_cast<int32_t>(a.s16[i]) - static_cast<int32_t>(b.s16[i]);
+        if (value > INT16_MAX) { result.s16[i] = INT16_MAX; saturated = true; }
+        else if (value < INT16_MIN) { result.s16[i] = INT16_MIN; saturated = true; }
+        else result.s16[i] = static_cast<int16_t>(value);
+    }
+    if (saturated) vscr |= PPC_VSCR_SAT;
+    d = result;
+}
+
+inline void PPC_VPKSWSS(PPCVRegister& d, uint32_t& vscr, const PPCVRegister& a, const PPCVRegister& b) noexcept
+{
+    PPCVRegister result{};
+    bool saturated = false;
+    const auto pack = [&saturated](int32_t value) noexcept -> int16_t {
+        if (value > INT16_MAX) { saturated = true; return INT16_MAX; }
+        if (value < INT16_MIN) { saturated = true; return INT16_MIN; }
+        return static_cast<int16_t>(value);
+    };
+    // Host lane order is the complete reversal of guest vector order.
+    for (size_t i = 0; i < 4; i++) result.s16[i] = pack(b.s32[i]);
+    for (size_t i = 0; i < 4; i++) result.s16[i + 4] = pack(a.s32[i]);
+    if (saturated) vscr |= PPC_VSCR_SAT;
+    d = result;
+}
+
+inline void PPC_VPKSWUS(PPCVRegister& d, uint32_t& vscr, const PPCVRegister& a, const PPCVRegister& b) noexcept
+{
+    PPCVRegister result{};
+    bool saturated = false;
+    const auto pack = [&saturated](int32_t value) noexcept -> uint16_t {
+        if (value > UINT16_MAX) { saturated = true; return UINT16_MAX; }
+        if (value < 0) { saturated = true; return 0; }
+        return static_cast<uint16_t>(value);
+    };
+    for (size_t i = 0; i < 4; i++) result.u16[i] = pack(b.s32[i]);
+    for (size_t i = 0; i < 4; i++) result.u16[i + 4] = pack(a.s32[i]);
+    if (saturated) vscr |= PPC_VSCR_SAT;
+    d = result;
+}
+
+// VMX packing writes the vB lanes before vA in this host representation,
+// because PPCVRegister is stored in reverse guest-vector lane order.
+inline void PPC_VPKUWUM(PPCVRegister& d, const PPCVRegister& a, const PPCVRegister& b) noexcept
+{
+    PPCVRegister result{};
+    for (size_t i = 0; i < 4; i++) result.u16[i] = static_cast<uint16_t>(b.u32[i]);
+    for (size_t i = 0; i < 4; i++) result.u16[i + 4] = static_cast<uint16_t>(a.u32[i]);
+    d = result;
+}
+
+inline void PPC_VPKSHSS(PPCVRegister& d, uint32_t& vscr, const PPCVRegister& a, const PPCVRegister& b) noexcept
+{
+    PPCVRegister result{};
+    bool saturated = false;
+    const auto pack = [&saturated](int16_t value) noexcept -> int8_t {
+        if (value > INT8_MAX) { saturated = true; return INT8_MAX; }
+        if (value < INT8_MIN) { saturated = true; return INT8_MIN; }
+        return static_cast<int8_t>(value);
+    };
+    for (size_t i = 0; i < 8; i++) result.s8[i] = pack(b.s16[i]);
+    for (size_t i = 0; i < 8; i++) result.s8[i + 8] = pack(a.s16[i]);
+    if (saturated) vscr |= PPC_VSCR_SAT;
+    d = result;
+}
+
+inline void PPC_VPKUHUS(PPCVRegister& d, uint32_t& vscr, const PPCVRegister& a, const PPCVRegister& b) noexcept
+{
+    PPCVRegister result{};
+    bool saturated = false;
+    const auto pack = [&saturated](uint16_t value) noexcept -> uint8_t {
+        if (value > UINT8_MAX) { saturated = true; return UINT8_MAX; }
+        return static_cast<uint8_t>(value);
+    };
+    for (size_t i = 0; i < 8; i++) result.u8[i] = pack(b.u16[i]);
+    for (size_t i = 0; i < 8; i++) result.u8[i + 8] = pack(a.u16[i]);
+    if (saturated) vscr |= PPC_VSCR_SAT;
+    d = result;
+}
+
+inline void PPC_VSUBUHS(PPCVRegister& d, uint32_t& vscr, const PPCVRegister& a, const PPCVRegister& b) noexcept
+{
+    PPCVRegister result{};
+    bool saturated = false;
+    for (size_t i = 0; i < 8; i++)
+    {
+        if (a.u16[i] < b.u16[i]) { result.u16[i] = 0; saturated = true; }
+        else result.u16[i] = static_cast<uint16_t>(a.u16[i] - b.u16[i]);
+    }
+    if (saturated) vscr |= PPC_VSCR_SAT;
+    d = result;
+}
+
+inline void PPC_VRLH(PPCVRegister& d, const PPCVRegister& a, const PPCVRegister& b) noexcept
+{
+    PPCVRegister result{};
+    for (size_t i = 0; i < 8; i++) {
+        const uint32_t sh = b.u16[i] & 15;
+        result.u16[i] = static_cast<uint16_t>((uint32_t(a.u16[i]) << sh) | (uint32_t(a.u16[i]) >> ((16 - sh) & 15)));
+    }
+    d = result;
+}
+
+inline void PPC_VSRH(PPCVRegister& d, const PPCVRegister& a, const PPCVRegister& b) noexcept
+{
+    PPCVRegister result{};
+    for (size_t i = 0; i < 8; i++) result.u16[i] = a.u16[i] >> (b.u16[i] & 15);
+    d = result;
+}
+
+inline void PPC_VSRAB(PPCVRegister& d, const PPCVRegister& a, const PPCVRegister& b) noexcept
+{
+    PPCVRegister result{};
+    for (size_t i = 0; i < 16; i++) {
+        const uint32_t sh = b.u8[i] & 7;
+        const uint8_t logical = a.u8[i] >> sh;
+        const uint8_t fill = (a.u8[i] & 0x80) && sh ? static_cast<uint8_t>(0xFFu << (8 - sh)) : 0;
+        result.u8[i] = logical | fill;
+    }
+    d = result;
+}
+
+inline void PPC_VADDSWS(PPCVRegister& d, uint32_t& vscr, const PPCVRegister& a, const PPCVRegister& b) noexcept
+{
+    PPCVRegister result{};
+    bool saturated = false;
+    for (size_t i = 0; i < 4; i++) {
+        const int64_t value = int64_t(a.s32[i]) + int64_t(b.s32[i]);
+        if (value > INT32_MAX) { result.s32[i] = INT32_MAX; saturated = true; }
+        else if (value < INT32_MIN) { result.s32[i] = INT32_MIN; saturated = true; }
+        else result.s32[i] = static_cast<int32_t>(value);
+    }
+    if (saturated) vscr |= PPC_VSCR_SAT;
+    d = result;
+}
+
+inline void PPC_VADDSBS(PPCVRegister& d, uint32_t& vscr, const PPCVRegister& a, const PPCVRegister& b) noexcept
+{
+    PPCVRegister result{};
+    bool saturated = false;
+    for (size_t i = 0; i < 16; i++) {
+        const int32_t value = int32_t(a.s8[i]) + int32_t(b.s8[i]);
+        if (value > INT8_MAX) { result.s8[i] = INT8_MAX; saturated = true; }
+        else if (value < INT8_MIN) { result.s8[i] = INT8_MIN; saturated = true; }
+        else result.s8[i] = static_cast<int8_t>(value);
+    }
+    if (saturated) vscr |= PPC_VSCR_SAT;
+    d = result;
+}
+
 #define PPC_ROUND_NEAREST 0x00
 #define PPC_ROUND_TOWARD_ZERO 0x01
 #define PPC_ROUND_UP 0x02
@@ -213,7 +509,12 @@ union alignas(0x10) PPCVRegister
 
 struct PPCFPSCRRegister
 {
-    uint32_t csr;
+    // Host floating-point control state is kept separately from the guest
+    // FPSCR.  The old representation used csr for both, which meant mffs could
+    // only observe the two host-derived rounding bits and could not retain
+    // architectural exception/result state.
+    uint32_t csr{};
+    uint32_t value{};
 
     static constexpr size_t HostToGuest[] = { PPC_ROUND_NEAREST, PPC_ROUND_DOWN, PPC_ROUND_UP, PPC_ROUND_TOWARD_ZERO };
 
@@ -260,13 +561,16 @@ struct PPCFPSCRRegister
     inline uint32_t loadFromHost() noexcept
     {
         csr = getcsr();
-        return HostToGuest[(csr & RoundMask) >> RoundShift];
+        value &= ~PPC_ROUND_MASK;
+        value |= HostToGuest[(csr & RoundMask) >> RoundShift];
+        return value;
     }
         
-    inline void storeFromGuest(uint32_t value) noexcept
+    inline void storeFromGuest(uint32_t guestValue) noexcept
     {
+        value = guestValue;
         csr &= ~RoundMask;
-        csr |= GuestToHost[value & PPC_ROUND_MASK];
+        csr |= GuestToHost[guestValue & PPC_ROUND_MASK];
         setcsr(csr);
     }
 
@@ -300,6 +604,159 @@ struct PPCFPSCRRegister
         }
     }
 };
+
+// PowerPC FPSCR bit masks use the architecture's conventional MSB-first bit
+// numbering.  These are the fields needed by frsqrte, including the summary
+// bits copied to CR1 by its recording form.
+inline constexpr uint32_t PPC_FPSCR_FX = 0x80000000u;
+inline constexpr uint32_t PPC_FPSCR_FEX = 0x40000000u;
+inline constexpr uint32_t PPC_FPSCR_VX = 0x20000000u;
+inline constexpr uint32_t PPC_FPSCR_OX = 0x10000000u;
+inline constexpr uint32_t PPC_FPSCR_ZX = 0x04000000u;
+inline constexpr uint32_t PPC_FPSCR_VXSNAN = 0x01000000u;
+inline constexpr uint32_t PPC_FPSCR_FR = 0x00040000u;
+inline constexpr uint32_t PPC_FPSCR_FI = 0x00020000u;
+inline constexpr uint32_t PPC_FPSCR_FPRF = 0x0001F000u;
+inline constexpr uint32_t PPC_FPSCR_VXSQRT = 0x00000200u;
+inline constexpr uint32_t PPC_FPSCR_VE = 0x00000080u;
+inline constexpr uint32_t PPC_FPSCR_ZE = 0x00000010u;
+inline constexpr uint32_t PPC_FPSCR_NI = 0x00000004u;
+
+inline uint32_t PPC_FPRF_FROM_F64(uint64_t bits) noexcept
+{
+    constexpr uint64_t SignMask = 0x8000000000000000ull;
+    constexpr uint64_t ExponentMask = 0x7FF0000000000000ull;
+    constexpr uint64_t MantissaMask = 0x000FFFFFFFFFFFFFull;
+    const bool negative = (bits & SignMask) != 0;
+    const uint32_t exponent = static_cast<uint32_t>((bits & ExponentMask) >> 52);
+    const uint64_t mantissa = bits & MantissaMask;
+
+    // FPRF is C, FL, FG, FE, FU in bits 15..19 of FPSCR.  The encodings are
+    // specified by the PowerPC result-class table and match the values used by
+    // the pinned Xenia native instruction tests.
+    uint32_t resultClass;
+    if (exponent == 0x7FFu)
+        resultClass = mantissa ? 0x11u : (negative ? 0x09u : 0x05u);
+    else if (exponent == 0)
+        resultClass = mantissa ? (negative ? 0x18u : 0x14u)
+                               : (negative ? 0x12u : 0x02u);
+    else
+        resultClass = negative ? 0x08u : 0x04u;
+    return resultClass << 12;
+}
+
+inline uint64_t PPC_FRSQRTE_VALUE(uint64_t bits, bool nonIEEE = false) noexcept
+{
+    constexpr uint64_t SignMask = 0x8000000000000000ull;
+    constexpr uint64_t ExponentMask = 0x7FF0000000000000ull;
+    constexpr uint64_t MantissaMask = 0x000FFFFFFFFFFFFFull;
+    constexpr uint64_t QuietMask = 0x0008000000000000ull;
+    constexpr uint64_t CanonicalQNaN = 0x7FF8000000000000ull;
+    constexpr uint8_t EstimateTable[16] = {
+        241, 216, 192, 168, 152, 136, 128, 112,
+        96, 76, 60, 48, 32, 24, 16, 8
+    };
+
+    const bool negative = (bits & SignMask) != 0;
+    uint32_t exponent = static_cast<uint32_t>((bits >> 52) & 0x7FFu);
+    uint64_t mantissa = bits & MantissaMask;
+
+    if (exponent == 0x7FFu && mantissa != 0)
+        return bits | QuietMask;
+    if (exponent == 0 && mantissa == 0)
+        return (bits & SignMask) | ExponentMask;
+    if (exponent == 0x7FFu && !negative)
+        return 0;
+    if (nonIEEE && exponent == 0)
+        return (bits & SignMask) | ExponentMask;
+    if (negative)
+        return CanonicalQNaN;
+
+    int32_t effectiveExponent = static_cast<int32_t>(exponent);
+    uint64_t normalizedMantissa = mantissa;
+    if (exponent == 0)
+    {
+        int leadingZeroes = 0;
+        uint64_t scan = mantissa;
+        while ((scan & SignMask) == 0)
+        {
+            scan <<= 1;
+            ++leadingZeroes;
+        }
+        normalizedMantissa = mantissa << (leadingZeroes - 11);
+        effectiveExponent = 12 - leadingZeroes;
+    }
+
+    const uint32_t topThree = static_cast<uint32_t>((normalizedMantissa >> 49) & 7u);
+    const uint32_t index = ((((static_cast<uint32_t>(effectiveExponent) & 1u) << 3) |
+                              topThree) ^ 8u);
+    const int32_t unbiased = effectiveExponent - 1023;
+    // C++ integer division truncates toward zero, while the architectural
+    // exponent expression requires floor division for negative odd values.
+    const int32_t half = unbiased >= 0 ? unbiased / 2 : -((-unbiased + 1) / 2);
+    const uint32_t resultExponent = static_cast<uint32_t>(1022 - half);
+    return (static_cast<uint64_t>(resultExponent) << 52) |
+           (static_cast<uint64_t>(EstimateTable[index]) << 44);
+}
+
+inline void PPC_FRSQRTE(PPCRegister& destination, PPCFPSCRRegister& fpscr,
+                        const PPCRegister& source, PPCCRRegister* cr1 = nullptr) noexcept
+{
+    constexpr uint64_t SignMask = 0x8000000000000000ull;
+    constexpr uint64_t ExponentMask = 0x7FF0000000000000ull;
+    constexpr uint64_t MantissaMask = 0x000FFFFFFFFFFFFFull;
+    constexpr uint64_t QuietMask = 0x0008000000000000ull;
+
+    const uint64_t bits = source.u64;
+    const bool negative = (bits & SignMask) != 0;
+    const uint32_t exponent = static_cast<uint32_t>((bits >> 52) & 0x7FFu);
+    const uint64_t mantissa = bits & MantissaMask;
+    const bool signalingNaN = exponent == 0x7FFu && mantissa != 0 &&
+                              (mantissa & QuietMask) == 0;
+    const bool invalidSqrt = negative && !signalingNaN &&
+                             !(exponent == 0 && mantissa == 0) &&
+                             !(exponent == 0x7FFu && mantissa != 0);
+    const bool treatedAsZero = exponent == 0 &&
+                               (mantissa == 0 || (fpscr.value & PPC_FPSCR_NI));
+
+    bool resultEnabled = true;
+    if (signalingNaN || invalidSqrt)
+    {
+        fpscr.value &= ~(PPC_FPSCR_FR | PPC_FPSCR_FI);
+        fpscr.value |= PPC_FPSCR_FX | PPC_FPSCR_VX |
+                       (signalingNaN ? PPC_FPSCR_VXSNAN : PPC_FPSCR_VXSQRT);
+        if (fpscr.value & PPC_FPSCR_VE)
+        {
+            fpscr.value |= PPC_FPSCR_FEX;
+            resultEnabled = false;
+        }
+    }
+    else if (treatedAsZero)
+    {
+        fpscr.value &= ~(PPC_FPSCR_FR | PPC_FPSCR_FI);
+        fpscr.value |= PPC_FPSCR_FX | PPC_FPSCR_ZX;
+        if (fpscr.value & PPC_FPSCR_ZE)
+        {
+            fpscr.value |= PPC_FPSCR_FEX;
+            resultEnabled = false;
+        }
+    }
+
+    if (resultEnabled)
+    {
+        destination.u64 = PPC_FRSQRTE_VALUE(bits, (fpscr.value & PPC_FPSCR_NI) != 0);
+        fpscr.value = (fpscr.value & ~PPC_FPSCR_FPRF) |
+                      PPC_FPRF_FROM_F64(destination.u64);
+    }
+
+    if (cr1)
+    {
+        cr1->lt = (fpscr.value & PPC_FPSCR_FX) != 0;
+        cr1->gt = (fpscr.value & PPC_FPSCR_FEX) != 0;
+        cr1->eq = (fpscr.value & PPC_FPSCR_VX) != 0;
+        cr1->so = (fpscr.value & PPC_FPSCR_OX) != 0;
+    }
+}
 
 struct alignas(0x40) PPCContext
 {
@@ -370,6 +827,7 @@ struct alignas(0x40) PPCContext
     PPCCRRegister cr7;
 #endif
     PPCFPSCRRegister fpscr;
+    uint32_t vscr = 0;
 
 #ifndef PPC_CONFIG_NON_ARGUMENT_AS_LOCAL
     PPCRegister f0;
@@ -680,6 +1138,20 @@ inline simde__m128i simde_mm_vctsxs(simde__m128 src1)
     xmm1 = simde_mm_andnot_si128(simde_mm_castps_si128(src1), xmm1);
     simde__m128 dest = simde_mm_blendv_ps(simde_mm_castsi128_ps(xmm0), simde_mm_castsi128_ps(simde_mm_set1_epi32(INT_MAX)), simde_mm_castsi128_ps(xmm1));
     return simde_mm_andnot_si128(simde_mm_castps_si128(xmm2), simde_mm_castps_si128(dest));
+}
+
+// vctuxs / vcfpuxws128: float to unsigned word, truncating and saturating
+// (NaN and negative values give 0, values from 2^32 give 0xFFFFFFFF).
+inline simde__m128i simde_mm_vctuxs(simde__m128 src1)
+{
+    // maxps returns its second operand for NaN, so NaN becomes 0.
+    simde__m128 clamped = simde_mm_max_ps(src1, simde_mm_setzero_ps());
+    const simde__m128 two31 = simde_mm_set1_ps(2147483648.0f);
+    simde__m128 high = simde_mm_cmpge_ps(clamped, two31);
+    simde__m128i result = simde_mm_cvttps_epi32(simde_mm_sub_ps(clamped, simde_mm_and_ps(high, two31)));
+    result = simde_mm_add_epi32(result, simde_mm_and_si128(simde_mm_castps_si128(high), simde_mm_set1_epi32(INT_MIN)));
+    simde__m128 over = simde_mm_cmpge_ps(clamped, simde_mm_set1_ps(4294967296.0f));
+    return simde_mm_or_si128(result, simde_mm_castps_si128(over));
 }
 
 inline simde__m128i simde_mm_vsr(simde__m128i a, simde__m128i b)
